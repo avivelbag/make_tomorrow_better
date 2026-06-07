@@ -1,12 +1,15 @@
 """Morning briefing: a one-glance snapshot of overnight swarm activity.
 
-Assembles a static snapshot from three workspace artifacts and renders it as a
-standalone HTML page served at ``GET /briefing``:
+Assembles a static snapshot from the authoritative workspace artifacts and
+renders it as a standalone HTML page served at ``GET /briefing``:
 
-* ``workspace/state.json``    — per-cycle completion records (timestamp + the
-  branches that merged / were rejected that cycle).
+* ``workspace/logs/cycles.jsonl`` — one JSON record per completed cycle, the
+  source of truth for per-cycle timestamps (``started_at``/``ended_at``) and
+  the branches that ``merged`` / were ``not_approved`` / failed the post-merge
+  test gate (``test_failures``).
 * ``workspace/workers.json``  — the latest worker result array, used to surface
-  any worker still in a ``blocked`` state.
+  any worker still in a ``blocked`` state. Each entry's human summary is the
+  JSON ``final_line`` the worker emitted, not a top-level field.
 * ``workspace/cycles/<NNN>/retro.md`` — the most recent cycle's retrospective,
   shown verbatim so the morning review needs no log digging.
 
@@ -52,14 +55,90 @@ def _load_json(path: Path):
         return None
 
 
+def _read_cycle_records(cycles_log: Path) -> list[dict]:
+    """Return every well-formed JSON object in ``cycles.jsonl``, in order.
+
+    The orchestrator appends one JSON record per line; a half-written tail line
+    or an absent file must degrade to an empty list, never raise.
+    """
+    try:
+        text = cycles_log.read_text()
+    except (OSError, UnicodeDecodeError):
+        return []
+    records: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            records.append(obj)
+    return records
+
+
+def _to_naive_local(dt: datetime) -> datetime:
+    """Collapse an aware datetime to naive local time; pass naive through.
+
+    ``cycles.jsonl`` timestamps are tz-aware UTC (``...+00:00``) while the
+    request handler anchors the window with a naive local ``now``. Comparing
+    aware and naive datetimes raises ``TypeError``, so both sides are funnelled
+    through here first. ``astimezone()`` with no argument converts an aware
+    value to the system local zone (and treats a naive value as already local).
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
 def _parse_dt(value) -> datetime | None:
-    """Parse an ISO-8601 string into a naive/aware datetime, tolerating junk."""
+    """Parse an ISO-8601 string into a naive-local datetime, tolerating junk."""
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value)
+        return _to_naive_local(datetime.fromisoformat(value))
     except ValueError:
         return None
+
+
+def _branches_from(entries) -> list[str]:
+    """Extract branch names from a cycle record's branch list.
+
+    ``merged`` is a list of bare branch strings; ``not_approved`` and
+    ``test_failures`` are lists of ``{"branch": ..., ...}`` dicts. Accept either
+    shape and drop anything without a usable branch name.
+    """
+    out: list[str] = []
+    if not isinstance(entries, list):
+        return out
+    for e in entries:
+        if isinstance(e, str):
+            out.append(e)
+        elif isinstance(e, dict):
+            branch = e.get("branch")
+            if isinstance(branch, str) and branch:
+                out.append(branch)
+    return out
+
+
+def _worker_summary(w: dict) -> str:
+    """Best-effort human summary for a worker result entry.
+
+    The real summary is a JSON string in ``final_line`` (``{"status": ...,
+    "summary": ...}``); decode it and read ``summary``. Fall back to a
+    top-level ``summary`` field, then to empty when neither is present.
+    """
+    final_line = w.get("final_line")
+    if isinstance(final_line, str):
+        try:
+            decoded = json.loads(final_line)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, dict) and decoded.get("summary"):
+            return str(decoded["summary"]).strip()
+    return str(w.get("summary") or "").strip()
 
 
 def _latest_retro(workspace: Path) -> tuple[str | None, str | None]:
@@ -95,30 +174,27 @@ def gather_briefing(workspace: Path, now: datetime) -> dict:
     """Assemble the briefing payload from workspace artifacts.
 
     ``now`` anchors the "since midnight" window so the result is deterministic
-    in tests. Cycles whose ``completed_at`` is at or after local midnight of
-    ``now`` count toward the overnight tally, and their merged/rejected branch
-    lists are aggregated. Malformed or missing fields are skipped, not fatal.
+    in tests. Cycles whose ``ended_at`` (falling back to ``started_at``) is at
+    or after local midnight of ``now`` count toward the overnight tally, and
+    their ``merged`` and rejected (``not_approved`` + ``test_failures``) branch
+    lists are aggregated. Malformed records or fields are skipped, not fatal.
     """
     workspace = Path(workspace)
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight = _to_naive_local(now).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    state = _load_json(workspace / "state.json") or {}
-    cycles = state.get("cycles") if isinstance(state, dict) else None
-    if not isinstance(cycles, list):
-        cycles = []
+    records = _read_cycle_records(workspace / "logs" / "cycles.jsonl")
 
     cycles_since_midnight = 0
     merged: list[str] = []
     rejected: list[str] = []
-    for entry in cycles:
-        if not isinstance(entry, dict):
-            continue
-        completed = _parse_dt(entry.get("completed_at"))
-        if completed is None or completed < midnight:
+    for entry in records:
+        when = _parse_dt(entry.get("ended_at")) or _parse_dt(entry.get("started_at"))
+        if when is None or when < midnight:
             continue
         cycles_since_midnight += 1
-        merged.extend(b for b in entry.get("merged", []) if isinstance(b, str))
-        rejected.extend(b for b in entry.get("rejected", []) if isinstance(b, str))
+        merged.extend(_branches_from(entry.get("merged")))
+        rejected.extend(_branches_from(entry.get("not_approved")))
+        rejected.extend(_branches_from(entry.get("test_failures")))
 
     workers = _load_json(workspace / "workers.json")
     blocked: list[dict] = []
@@ -128,7 +204,7 @@ def gather_briefing(workspace: Path, now: datetime) -> dict:
                 blocked.append(
                     {
                         "branch": str(w.get("branch") or "(unknown)"),
-                        "summary": str(w.get("summary") or "").strip(),
+                        "summary": _worker_summary(w),
                     }
                 )
 
