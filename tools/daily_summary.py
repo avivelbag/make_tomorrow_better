@@ -1,15 +1,3 @@
-"""Daily git-activity summary CLI.
-
-Gathers the day's commits (``git log --since=<date> --no-merges`` with machine
-parseable ``--numstat`` output), prints what was shipped, and asks ``claude -p``
-for a short *future-you memo* describing the work and the most natural place to
-pick up tomorrow.
-
-The git-log parsing and date arithmetic are factored into pure functions so they
-are unit-testable without a real repo or LLM. The LLM and git calls are injected
-as callables (``runner``) so tests stay deterministic and offline.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -18,11 +6,10 @@ import sys
 from datetime import datetime
 from typing import Callable, Optional, Sequence
 
-# ASCII control chars used as field/record separators in the git pretty format.
-# They never appear in commit metadata, so parsing is unambiguous even when a
-# subject line contains tabs, pipes, or commas.
-_RS = "\x1e"  # record separator: prefixes each commit header line
-_FS = "\x1f"  # field separator: between commit header fields
+# ASCII control chars as field/record separators: they never appear in commit
+# metadata, so parsing stays unambiguous even when a subject contains tabs/pipes.
+_RS = "\x1e"
+_FS = "\x1f"
 
 _PRETTY = f"{_RS}%H{_FS}%an{_FS}%ad{_FS}%s"
 
@@ -30,22 +17,11 @@ Runner = Callable[[Sequence[str]], str]
 
 
 def default_since(now: datetime) -> str:
-    """Return midnight (00:00:00) of ``now``'s day as an ISO-8601 string.
-
-    ``now`` is passed in rather than read from the clock so callers (and tests)
-    control the reference time; this keeps date arithmetic deterministic.
-    """
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight.isoformat()
 
 
 def resolve_since(value: Optional[str], now: datetime) -> str:
-    """Resolve the ``--since`` argument, falling back to midnight today.
-
-    A blank or missing value yields :func:`default_since`; any other value is
-    passed through verbatim so the user keeps git's full date-spec vocabulary
-    (e.g. ``"2 days ago"``, ``"2026-06-01"``).
-    """
     if value is None or not value.strip():
         return default_since(now)
     return value
@@ -61,13 +37,6 @@ def _run_git(args: Sequence[str]) -> str:
 
 
 def collect_git_log(since: str, *, runner: Optional[Runner] = None) -> str:
-    """Return raw ``git log`` output for commits since ``since``.
-
-    Uses ``--numstat`` for machine-readable per-file add/delete counts and a
-    control-char ``--pretty`` format so :func:`parse_git_log` can split records
-    without ambiguity. Merge commits are excluded to keep the summary about work
-    actually authored.
-    """
     if runner is None:
         runner = _run_git
     return runner(
@@ -83,15 +52,11 @@ def collect_git_log(since: str, *, runner: Optional[Runner] = None) -> str:
 
 
 def _parse_numstat(line: str) -> Optional[dict]:
-    """Parse one ``--numstat`` line (``added\\tdeleted\\tpath``).
-
-    Binary files report ``-`` for the counts; those are treated as zero. Returns
-    ``None`` for lines that are not valid numstat rows.
-    """
     parts = line.split("\t")
     if len(parts) != 3:
         return None
     added_s, deleted_s, path = parts
+    # Binary files report "-" for the counts; treat those as zero.
     added = 0 if added_s == "-" else int(added_s) if added_s.isdigit() else None
     deleted = 0 if deleted_s == "-" else int(deleted_s) if deleted_s.isdigit() else None
     if added is None or deleted is None:
@@ -100,12 +65,6 @@ def _parse_numstat(line: str) -> Optional[dict]:
 
 
 def parse_git_log(text: str) -> dict:
-    """Parse :func:`collect_git_log` output into structured activity data.
-
-    Returns a dict with ``commits`` (each carrying its files), the count of
-    unique ``files_changed``, and total ``insertions``/``deletions``. An empty
-    or whitespace-only input yields a zeroed, empty result.
-    """
     commits: list[dict] = []
     files_changed: set[str] = set()
     insertions = 0
@@ -149,7 +108,6 @@ def parse_git_log(text: str) -> dict:
 
 
 def format_activity(activity: dict) -> str:
-    """Render parsed activity as a human-readable plain-text block."""
     commits = activity["commits"]
     lines = [
         f"Commits: {len(commits)}",
@@ -168,7 +126,6 @@ def format_activity(activity: dict) -> str:
 
 
 def build_prompt(since: str, activity: dict) -> str:
-    """Build the ``claude -p`` prompt requesting a future-you memo."""
     return (
         "You are writing a short memo to your future self. Below is a summary of "
         "the git activity since "
@@ -195,17 +152,13 @@ def generate_narrative(
     *,
     runner: Optional[Runner] = None,
 ) -> str:
-    """Ask ``claude -p`` for the future-you memo; degrade gracefully on failure.
-
-    If there are no commits, returns a fixed message and skips the LLM entirely.
-    Any error from the ``claude`` CLI is caught so the structured summary above
-    is still useful on its own.
-    """
     if not activity["commits"]:
         return "No commits today — nothing to summarize. Fresh start tomorrow."
     if runner is None:
         runner = _run_claude
     prompt = build_prompt(since, activity)
+    # Degrade gracefully: the structured activity block is useful even if the
+    # claude CLI is missing or errors.
     try:
         out = runner(["claude", "-p", prompt])
     except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
@@ -219,7 +172,6 @@ def build_summary(
     git_runner: Optional[Runner] = None,
     claude_runner: Optional[Runner] = None,
 ) -> str:
-    """Produce the full printable summary: activity block + narrative memo."""
     raw = collect_git_log(since, runner=git_runner)
     activity = parse_git_log(raw)
     narrative = generate_narrative(since, activity, runner=claude_runner)
@@ -237,6 +189,7 @@ def main(argv: Optional[Sequence[str]] = None, *, now: Optional[datetime] = None
     )
     ns = parser.parse_args(argv)
 
+    # now is injectable so date arithmetic stays deterministic under test.
     reference = now if now is not None else datetime.now()
     since = resolve_since(ns.since, reference)
     print(build_summary(since))
