@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import improvement_metric, lessons, retrospective
+from src import failed_merge, improvement_metric, lessons, retrospective
 
 
 class Orchestrator:
@@ -32,7 +32,12 @@ class Orchestrator:
         return lessons.write_lessons(self.workspace)
 
     def _merge_reviewed(self, cycle: int) -> dict:
-        return {}
+        # The git merge/test-gate machinery lives in the run harness; here we
+        # close the feedback loop it leaves open: any approved branch that was
+        # hard-reset because its post-merge tests failed gets a structured
+        # failed-merge carryover note so the next cycle can rework it.
+        failed_notes = failed_merge.record_failed_merges(self.workspace)
+        return {"failed_notes": [str(p) for p in failed_notes]}
 
     def _run_retrospective(self, cycle: int) -> dict | None:
         if not self.config.get("retrospective_enabled", True):
