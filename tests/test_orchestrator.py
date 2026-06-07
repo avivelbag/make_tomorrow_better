@@ -60,3 +60,41 @@ def test_retrospective_enabled_by_default(tmp_path, capsys):
 
     assert (ws / "cycles" / "001" / "retro.md").is_file()
     assert "[retrospective] cycle 001" in capsys.readouterr().out
+
+
+def _seed_cycle_snapshot(workspace, cycle, branch, verdict):
+    cdir = workspace / "cycles" / cycle
+    reviews = cdir / "reviews"
+    reviews.mkdir(parents=True, exist_ok=True)
+    (cdir / "workers.json").write_text(
+        json.dumps(
+            [{"branch": branch, "status": "completed", "commit": "x", "summary": "9 tests"}]
+        )
+    )
+    (reviews / "r.md").write_text(f"---\nbranch: {branch}\nverdict: {verdict}\n---\n")
+
+
+def test_run_cycle_records_and_logs_betterness(tmp_path, capsys):
+    ws = tmp_path / "ws"
+    _seed(ws)
+    _seed_cycle_snapshot(ws, "007", "swarm/07-a", "approve")
+
+    result = Orchestrator(ws, {"retrospective_enabled": True}).run_cycle(7)
+
+    out = capsys.readouterr().out
+    assert "[betterness] cycle 007" in out
+    assert (ws / "betterness.jsonl").is_file()
+    assert result["betterness"]["branches_merged"] == 1
+    assert result["betterness"]["delta_vs_yesterday"] is None
+
+
+def test_betterness_skipped_when_retrospective_disabled(tmp_path, capsys):
+    ws = tmp_path / "ws"
+    _seed(ws)
+    orch = Orchestrator(ws, {"retrospective_enabled": False})
+
+    result = orch.run_cycle(3)
+
+    assert result["betterness"] is None
+    assert not (ws / "betterness.jsonl").exists()
+    assert capsys.readouterr().out == ""
