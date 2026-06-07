@@ -8,9 +8,10 @@ deduplicated, frequency-ranked ``_lessons.md`` (top recurring issues only).
 
 The rendered lessons are meant to be injected into the worker prompt via the
 ``<<lessons>>`` placeholder so the swarm stops repeating the same mistakes.
-This project has no ``load_prompt()`` machinery, so :func:`load_lessons` and
-:func:`substitute_lessons` stand in for that flow: they read ``_lessons.md``
-(empty string when absent) and substitute it into a template.
+:func:`load_lessons` reads ``_lessons.md`` (empty string when absent) and
+:func:`substitute_lessons` fills the placeholder, which is how a prompt loader
+wires lessons into the worker prompt. :class:`src.orchestrator.Orchestrator`
+calls :func:`write_lessons` once per cycle so the file stays current.
 
 Everything here is pure-Python and deterministic — no LLM call — so it is free,
 reproducible, and unit-testable.
@@ -214,8 +215,7 @@ def load_lessons(workspace: Path) -> str:
 def substitute_lessons(template: str, workspace: Path) -> str:
     """Replace the ``<<lessons>>`` placeholder with the instance's lessons.
 
-    Stands in for the ``load_prompt()`` flow described in the suggestion: the
-    placeholder is filled from ``_lessons.md`` and becomes the empty string when
-    that file is missing or empty.
+    The placeholder is filled from ``_lessons.md`` and becomes the empty string
+    when that file is missing or empty.
     """
     return template.replace(LESSONS_PLACEHOLDER, load_lessons(workspace))

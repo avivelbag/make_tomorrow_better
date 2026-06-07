@@ -60,3 +60,48 @@ def test_retrospective_enabled_by_default(tmp_path, capsys):
 
     assert (ws / "cycles" / "001" / "retro.md").is_file()
     assert "[retrospective] cycle 001" in capsys.readouterr().out
+
+
+def _seed_rejecting_review(workspace, cycle, slug, branch, reason):
+    reviews = workspace / "cycles" / f"{cycle:03d}" / "reviews"
+    reviews.mkdir(parents=True, exist_ok=True)
+    (reviews / f"{slug}.md").write_text(
+        f"---\nbranch: {branch}\nverdict: reject\n---\n\n## Summary\n{reason}\n"
+    )
+
+
+def test_run_cycle_refreshes_lessons_from_prior_reviews(tmp_path, capsys):
+    ws = tmp_path / "ws"
+    _seed(ws)
+    _seed_rejecting_review(ws, 1, "a", "swarm/01-a", "Missing tests for failure mode.")
+    _seed_rejecting_review(ws, 2, "b", "swarm/02-b", "Missing tests for failure mode.")
+
+    result = Orchestrator(ws).run_cycle(3)
+
+    lessons_file = ws / "_lessons.md"
+    assert lessons_file.is_file()
+    assert result["lessons"] == lessons_file
+    text = lessons_file.read_text()
+    assert "(2×) Missing tests for failure mode." in text
+
+
+def test_run_cycle_writes_empty_lessons_when_no_rejections(tmp_path):
+    ws = tmp_path / "ws"
+    _seed(ws)
+
+    Orchestrator(ws).run_cycle(1)
+
+    lessons_file = ws / "_lessons.md"
+    assert lessons_file.is_file()
+    assert lessons_file.read_text() == ""
+
+
+def test_lessons_disabled_skips_refresh(tmp_path):
+    ws = tmp_path / "ws"
+    _seed(ws)
+    _seed_rejecting_review(ws, 1, "a", "swarm/01-a", "Some recurring problem.")
+
+    result = Orchestrator(ws, {"lessons_enabled": False}).run_cycle(2)
+
+    assert result["lessons"] is None
+    assert not (ws / "_lessons.md").exists()
