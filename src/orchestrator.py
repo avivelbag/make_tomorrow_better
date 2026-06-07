@@ -7,9 +7,10 @@ here; the merge phase is a thin seam other cycle work hangs off of.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
-from src import retrospective
+from src import improvement_metric, retrospective
 
 
 class Orchestrator:
@@ -27,7 +28,26 @@ class Orchestrator:
         print(result["summary"])
         return result
 
+    def _record_betterness(self, cycle: int) -> dict | None:
+        # Record today's betterness score and log whether today beat yesterday.
+        # self.workspace is the instance dir, so split it into root + name for
+        # the workspace_root/<instance>/cycles layout the metric reads.
+        try:
+            row = improvement_metric.record_daily_score(
+                self.workspace.name,
+                date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                workspace_root=self.workspace.parent,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[betterness] cycle {cycle:03d}: failed (non-fatal): {e!r}")
+            return None
+        print(f"[betterness] cycle {cycle:03d}: {improvement_metric.verdict_line(row)}")
+        return row
+
     def run_cycle(self, cycle: int) -> dict:
         merged = self._merge_reviewed(cycle)
         retro = self._run_retrospective(cycle)
-        return {"merged": merged, "retro": retro}
+        # Betterness is a cycle-end signal that depends on the snapshot the
+        # retrospective phase produces, so it is skipped when that phase is off.
+        better = self._record_betterness(cycle) if retro is not None else None
+        return {"merged": merged, "retro": retro, "betterness": better}
