@@ -1,15 +1,10 @@
 """Post-cycle retrospective agent.
 
-After the merge phase of a swarm cycle completes, this module reads the
-cycle's artifacts (reviewer verdicts, worker results, and the merge/test log)
-and synthesises a short, actionable retrospective written to
-``workspace/cycles/<NNN>/retro.md``.
-
-The synthesis is intentionally pure-Python and deterministic — there is no LLM
-call here. That keeps the retrospective reproducible, free, and unit-testable,
-and means the orchestrator can invoke it inline at the end of every cycle
-without spending quota. The orchestrator is expected to call :func:`run` after
-its merge phase and print the returned summary to stdout.
+Reads a cycle's artifacts (reviewer verdicts, worker results, merge/test log)
+and writes a short actionable retrospective to ``workspace/cycles/<NNN>/retro.md``.
+The synthesis is pure-Python and deterministic — no LLM call — so it is free,
+reproducible, and unit-testable. The orchestrator calls :func:`run` after its
+merge phase and prints the returned ``summary``.
 """
 
 from __future__ import annotations
@@ -18,15 +13,13 @@ import json
 import re
 from pathlib import Path
 
-# A merge-tests.log line emitted by the merge gate per branch, e.g.
+# Timestamp prefix is optional so the parser tolerates both the raw and the
+# timestamped merge-tests.log formats:
 #   [22:31:04] === merge swarm/01-foo -> tests rc=0 ===
-# The timestamp prefix is optional so the parser tolerates both the raw and the
-# timestamped log formats.
 _MERGE_LINE_RE = re.compile(
     r"===\s*merge\s+(?P<branch>\S+)\s*->\s*tests\s+rc=(?P<rc>\S+?)\s*==="
 )
 
-#: Per-branch outcome labels used throughout the retro.
 MERGED = "merged"
 BLOCKED = "blocked"
 REJECTED = "rejected"
@@ -35,7 +28,6 @@ _CHANGE_VERDICTS = ("reject", "request-changes")
 
 
 def _read_text(path: Path) -> str:
-    """Return the file's text, or an empty string if it is missing/unreadable."""
     try:
         return path.read_text()
     except (OSError, UnicodeDecodeError):
@@ -43,14 +35,6 @@ def _read_text(path: Path) -> str:
 
 
 def parse_review_verdicts(reviews_dir: Path) -> dict[str, str]:
-    """Map each reviewed branch to its verdict from ``reviews/*.md`` frontmatter.
-
-    Each review file is expected to begin with a YAML frontmatter block
-    delimited by ``---`` lines containing at least ``branch`` and ``verdict``.
-    Files without a parseable branch are skipped. A missing directory yields an
-    empty mapping rather than raising, so a cycle that produced no reviews is
-    handled gracefully.
-    """
     verdicts: dict[str, str] = {}
     if not reviews_dir.is_dir():
         return verdicts
@@ -76,12 +60,6 @@ def parse_review_verdicts(reviews_dir: Path) -> dict[str, str]:
 
 
 def parse_workers(workers_json: Path) -> list[dict]:
-    """Load the worker result array from ``workers.json``.
-
-    Returns an empty list if the file is missing or does not contain a JSON
-    array, so malformed or partial runs degrade to "no workers" instead of
-    crashing the retrospective.
-    """
     text = _read_text(workers_json)
     if not text.strip():
         return []
@@ -95,13 +73,6 @@ def parse_workers(workers_json: Path) -> list[dict]:
 
 
 def parse_merge_results(merge_log: Path) -> dict[str, bool]:
-    """Map each merged branch to whether its post-merge tests passed.
-
-    Parsed from ``logs/merge-tests.log`` lines of the form
-    ``=== merge <branch> -> tests rc=<code> ===``. ``rc=0`` is a pass; any
-    other code (including ``timeout``) is a failure. If a branch appears more
-    than once the last occurrence wins, matching the log's chronological order.
-    """
     results: dict[str, bool] = {}
     text = _read_text(merge_log)
     if not text:
@@ -112,22 +83,12 @@ def parse_merge_results(merge_log: Path) -> dict[str, bool]:
 
 
 def classify_branch(status: str, verdict: str, merge_passed: bool | None) -> str:
-    """Reduce a branch's signals to one of ``merged`` / ``blocked`` / ``rejected``.
-
-    Precedence:
-      1. A worker that reported ``blocked`` (or never committed) is ``blocked``.
-      2. A reviewer ``reject`` / ``request-changes`` verdict is ``rejected``.
-      3. An ``approve`` verdict is ``merged`` — unless the merge gate recorded a
-         failing post-merge test run for it, in which case it was reverted and
-         is ``rejected``.
-      4. Anything else (no/unknown verdict on a completed worker) is ``blocked``
-         because it never made it through review.
-    """
     if status == "blocked":
         return BLOCKED
     if verdict in _CHANGE_VERDICTS:
         return REJECTED
     if verdict == "approve":
+        # An approved branch whose post-merge tests failed was reverted.
         if merge_passed is False:
             return REJECTED
         return MERGED
@@ -139,13 +100,6 @@ def build_branch_outcomes(
     verdicts: dict[str, str],
     merge_results: dict[str, bool],
 ) -> list[dict]:
-    """Join worker results, review verdicts, and merge outcomes per branch.
-
-    Branches are sourced from both ``workers`` and the review verdicts so a
-    review with no matching worker entry (or vice versa) still appears. Returns
-    a list of ``{"branch", "outcome", "verdict", "status", "summary"}`` dicts
-    sorted by branch name for stable output.
-    """
     by_branch: dict[str, dict] = {}
     for w in workers:
         branch = w.get("branch")
@@ -158,9 +112,6 @@ def build_branch_outcomes(
         w = by_branch.get(branch)
         status = str((w or {}).get("status") or "")
         if w is not None and not w.get("commit") and status not in ("completed", "blocked"):
-            # A worker entry with neither a commit nor a terminal status
-            # produced nothing reviewable. Branches sourced only from reviews
-            # (no worker entry) keep an empty status so their verdict decides.
             status = "blocked"
         verdict = verdicts.get(branch, "")
         merge_passed = merge_results.get(branch)
@@ -178,12 +129,6 @@ def build_branch_outcomes(
 
 
 def detect_patterns(outcomes: list[dict], merge_results: dict[str, bool]) -> list[str]:
-    """Return up to the top 3 cross-branch patterns, most significant first.
-
-    Candidate patterns are scored by how many branches they cover; only those
-    affecting at least one branch are emitted. If fewer than three signals fire
-    the list is shorter rather than padded with noise.
-    """
     total = len(outcomes)
     if total == 0:
         return ["No worker branches were produced this cycle."]
@@ -225,12 +170,6 @@ def detect_patterns(outcomes: list[dict], merge_results: dict[str, bool]) -> lis
 
 
 def suggest_tweak(outcomes: list[dict], merge_results: dict[str, bool]) -> str:
-    """Pick one concrete prompt/config tweak to try next cycle.
-
-    The dominant failure mode drives the suggestion: widespread blocking points
-    at under-specified suggestions; widespread rejection points at weak worker
-    test discipline; post-merge test failures point at a leaky reviewer gate.
-    """
     total = len(outcomes) or 1
     n_blocked = sum(1 for o in outcomes if o["outcome"] == BLOCKED)
     n_rejected = sum(1 for o in outcomes if o["outcome"] == REJECTED)
@@ -260,11 +199,6 @@ def render_retro(
     patterns: list[str],
     tweak: str,
 ) -> str:
-    """Render the retrospective markdown document.
-
-    The document has three fixed sections matching the acceptance criteria: a
-    one-line verdict per branch, the top patterns, and a single concrete tweak.
-    """
     lines = [f"# Cycle {cycle:03d} retrospective", ""]
 
     lines.append("## Branch verdicts")
@@ -289,7 +223,6 @@ def render_retro(
 
 
 def format_summary(cycle: int, outcomes: list[dict], retro_path: Path) -> str:
-    """One-block stdout summary for the orchestrator to print at cycle end."""
     counts = {MERGED: 0, BLOCKED: 0, REJECTED: 0}
     for o in outcomes:
         counts[o["outcome"]] = counts.get(o["outcome"], 0) + 1
@@ -306,16 +239,6 @@ def run(
     cycle: int,
     log_dir: Path | None = None,
 ) -> dict:
-    """Generate the cycle retrospective and write it to disk.
-
-    Reads ``workspace/reviews/*.md``, ``workspace/workers.json`` and
-    ``<log_dir>/merge-tests.log`` (defaulting to ``workspace/logs/``), writes
-    ``workspace/cycles/<NNN>/retro.md``, and returns a dict with the resolved
-    ``path``, the per-branch ``outcomes``, ``patterns``, the suggested
-    ``tweak``, and a printable ``summary`` line. Safe to call on a cycle with
-    missing artifacts — it produces a retro noting the absence rather than
-    raising.
-    """
     workspace = Path(workspace)
     if log_dir is None:
         log_dir = workspace / "logs"
